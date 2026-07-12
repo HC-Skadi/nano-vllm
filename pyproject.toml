@@ -19,6 +19,10 @@ dependencies = [
     "xxhash",
 ]
 
+[project.optional-dependencies]
+awq = ["vllm==0.8.5", "transformers==4.51.3"]
+test = ["pytest>=8"]
+
 [project.urls]
 Homepage="https://github.com/GeeeekExplorer/nano-vllm"
 

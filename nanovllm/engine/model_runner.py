@@ -8,6 +8,7 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
+from nanovllm.layers.quantization.awq import vllm_awq_ops_available
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
@@ -23,12 +24,36 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
+        architectures = set(getattr(hf_config, "architectures", []) or [])
+        supported_architectures = {"Qwen2ForCausalLM", "Qwen3ForCausalLM"}
+        model_type = getattr(hf_config, "model_type", None)
+        if architectures:
+            supported = bool(architectures & supported_architectures)
+        else:
+            supported = model_type in {"qwen2", "qwen3"}
+        if not supported:
+            raise ValueError(
+                f"Unsupported model architecture {sorted(architectures)} "
+                f"(model_type={model_type!r}); nano-vllm supports "
+                f"{sorted(supported_architectures)}"
+            )
+        if (
+            config.quant_config is not None
+            and not self.enforce_eager
+            and not vllm_awq_ops_available()
+        ):
+            raise RuntimeError(
+                "AWQ CUDA Graph mode requires vLLM AWQ operators. Install "
+                "nano-vllm[awq] or set enforce_eager=True for the slow "
+                "PyTorch reference fallback."
+            )
+
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(hf_config.dtype)
+        torch.set_default_dtype(config.runtime_dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
+        self.model = Qwen3ForCausalLM(hf_config, quant_config=config.quant_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
@@ -109,7 +134,14 @@ class ModelRunner:
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
+        block_bytes = (
+            2
+            * hf_config.num_hidden_layers
+            * self.block_size
+            * num_kv_heads
+            * head_dim
+            * config.runtime_dtype.itemsize
+        )
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
