@@ -6,7 +6,7 @@ from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
-from nanovllm.models.qwen3 import Qwen3ForCausalLM
+from nanovllm.models import get_model_class
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
@@ -28,7 +28,11 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
+        model_class = get_model_class(hf_config)
+        self.model = model_class(hf_config)
+        self.enforce_eager = self.enforce_eager or not getattr(
+            self.model, "supports_cuda_graph", True
+        )
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
@@ -102,23 +106,71 @@ class ModelRunner:
 
     def allocate_kv_cache(self):
         config = self.config
-        hf_config = config.hf_config
         free, total = torch.cuda.mem_get_info()
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
-        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
-        assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
-        layer_id = 0
+
+        cache_modules = []
+        fallback_dtype = next(self.model.parameters()).dtype
+        block_bytes = 0
         for module in self.model.modules():
-            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                module.k_cache = self.kv_cache[0, layer_id]
-                module.v_cache = self.kv_cache[1, layer_id]
-                layer_id += 1
+            if not (hasattr(module, "k_cache") and hasattr(module, "v_cache")):
+                continue
+            if not hasattr(module, "num_kv_heads") or not hasattr(module, "head_dim"):
+                raise RuntimeError(
+                    f"Cache module {type(module).__name__} must define "
+                    "num_kv_heads and head_dim"
+                )
+            num_kv_heads = int(module.num_kv_heads)
+            head_dim = int(module.head_dim)
+            if num_kv_heads <= 0 or head_dim <= 0:
+                raise RuntimeError(
+                    f"Invalid KV cache shape on {type(module).__name__}: "
+                    f"num_kv_heads={num_kv_heads}, head_dim={head_dim}"
+                )
+            module_param = next(module.parameters(), None)
+            dtype = module_param.dtype if module_param is not None else fallback_dtype
+            cache_modules.append((module, num_kv_heads, head_dim, dtype))
+            block_bytes += (
+                2
+                * self.block_size
+                * num_kv_heads
+                * head_dim
+                * dtype.itemsize
+            )
+
+        if not cache_modules:
+            raise RuntimeError("Model does not expose any KV cache modules")
+
+        available_bytes = int(
+            total * config.gpu_memory_utilization - used - peak + current
+        )
+        num_kvcache_blocks = available_bytes // block_bytes
+        if self.world_size > 1:
+            # The scheduler runs on rank 0, so every TP rank must expose the same
+            # physical block range. Use the most constrained GPU when free
+            # memory differs across ranks.
+            block_count = torch.tensor(
+                num_kvcache_blocks, dtype=torch.int64, device="cuda"
+            )
+            dist.all_reduce(block_count, op=dist.ReduceOp.MIN)
+            num_kvcache_blocks = int(block_count.item())
+        config.num_kvcache_blocks = num_kvcache_blocks
+        assert config.num_kvcache_blocks > 0
+        self.kv_cache = []
+        for module, num_kv_heads, head_dim, dtype in cache_modules:
+            cache_shape = (
+                config.num_kvcache_blocks,
+                self.block_size,
+                num_kv_heads,
+                head_dim,
+            )
+            k_cache = torch.empty(cache_shape, dtype=dtype)
+            v_cache = torch.empty(cache_shape, dtype=dtype)
+            module.k_cache = k_cache
+            module.v_cache = v_cache
+            self.kv_cache.append((k_cache, v_cache))
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
