@@ -21,7 +21,10 @@ class RMSNorm(nn.Module):
         orig_dtype = x.dtype
         x = x.float()
         var = x.pow(2).mean(dim=-1, keepdim=True)
-        x.mul_(torch.rsqrt(var + self.eps))
+        # Keep the input intact when it is already FP32.  ``Tensor.float()``
+        # aliases FP32 inputs, so an in-place multiply would also overwrite the
+        # residual held by the decoder layer.
+        x = x * torch.rsqrt(var + self.eps)
         x = x.to(orig_dtype).mul_(self.weight)
         return x
 
@@ -35,7 +38,9 @@ class RMSNorm(nn.Module):
         x = x.float().add_(residual.float())
         residual = x.to(orig_dtype)
         var = x.pow(2).mean(dim=-1, keepdim=True)
-        x.mul_(torch.rsqrt(var + self.eps))
+        # Use an out-of-place normalization so ``residual`` remains the
+        # pre-normalized sum even when orig_dtype is FP32 and the cast aliases.
+        x = x * torch.rsqrt(var + self.eps)
         x = x.to(orig_dtype).mul_(self.weight)
         return x, residual
 
