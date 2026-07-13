@@ -126,6 +126,10 @@ class EagerRMSNorm(nn.Module):
 
 class DeepseekV2Test(unittest.TestCase):
 
+    def test_rejects_awq_quantization_explicitly(self):
+        with self.assertRaisesRegex(ValueError, "AWQ quantization is not supported"):
+            DeepseekV2ForCausalLM(tiny_config(), quant_config=object())
+
     def setUp(self):
         torch.manual_seed(0)
 
@@ -419,7 +423,7 @@ class DeepseekV2Test(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as model_dir:
             save_file(tensors, f"{model_dir}/model.safetensors")
-            load_model(model, model_dir)
+            load_model(model, model_dir, strict=False)
 
         dense = model.get_parameter(
             "model.layers.0.mlp.gate_up_proj.weight"

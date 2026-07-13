@@ -16,6 +16,14 @@ class ModelRegistryTest(unittest.TestCase):
 
         self.assertIs(get_model_class(config), Qwen3ForCausalLM)
 
+    def test_qwen2_uses_shared_qwen_model_implementation(self):
+        config = SimpleNamespace(
+            architectures=["Qwen2ForCausalLM"],
+            model_type="qwen2",
+        )
+
+        self.assertIs(get_model_class(config), Qwen3ForCausalLM)
+
     def test_accepts_single_architecture_string(self):
         config = SimpleNamespace(
             architectures="Qwen3ForCausalLM",
