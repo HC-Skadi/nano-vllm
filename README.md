@@ -15,6 +15,7 @@ A lightweight vLLM implementation built from scratch.
 * 🚀 **Fast offline inference** - Comparable inference speeds to vLLM
 * 📖 **Readable codebase** - Clean implementation in ~ 1,200 lines of Python code
 * ⚡ **Optimization Suite** - Prefix caching, Tensor Parallelism, Torch compilation, CUDA graph, etc.
+* 🤖 **MoE model support** - Correctness-first BF16 inference for DeepSeek-V2-Lite and DeepSeek-V2-Lite-Chat
 
 ## Installation
 
@@ -42,6 +43,17 @@ prompts = ["Hello, Nano-vLLM."]
 outputs = llm.generate(prompts, sampling_params)
 outputs[0]["text"]
 ```
+
+## MoE / DeepSeek
+
+The first MoE model path targets the BF16 DeepSeek-V2-Lite and
+DeepSeek-V2-Lite-Chat checkpoints. It supports top-k and shared experts, MLA
+with expanded K/V caching, YaRN, tensor parallelism, and eager execution. Use
+`enforce_eager=True` and start with a smaller `max_num_batched_tokens` (for
+example, `2048`) to limit warm-up and prefill memory.
+
+See [MoE and DeepSeek support](docs/moe.md) for the support matrix, current
+limitations, model download command, and an `LLM` example.
 
 ## Benchmark
 
