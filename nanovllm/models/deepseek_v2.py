@@ -488,8 +488,10 @@ class DeepseekV2ForCausalLM(nn.Module):
         "up_proj": ("gate_up_proj", 1),
     }
 
-    def __init__(self, config) -> None:
+    def __init__(self, config, quant_config=None) -> None:
         super().__init__()
+        if quant_config is not None:
+            raise ValueError("AWQ quantization is not supported for DeepSeek-V2")
         self.model = DeepseekV2Model(config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if bool(getattr(config, "tie_word_embeddings", False)):

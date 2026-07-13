@@ -8,6 +8,7 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models import get_model_class
 from nanovllm.layers.sampler import Sampler
+from nanovllm.layers.quantization.awq import vllm_awq_ops_available
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
@@ -23,13 +24,24 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
+        if (
+            config.quant_config is not None
+            and not self.enforce_eager
+            and not vllm_awq_ops_available()
+        ):
+            raise RuntimeError(
+                "AWQ CUDA Graph mode requires vLLM AWQ operators. Install "
+                "nano-vllm[awq] or set enforce_eager=True for the slow "
+                "PyTorch reference fallback."
+            )
+
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(hf_config.dtype)
+        torch.set_default_dtype(config.runtime_dtype)
         torch.set_default_device("cuda")
         model_class = get_model_class(hf_config)
-        self.model = model_class(hf_config)
+        self.model = model_class(hf_config, quant_config=config.quant_config)
         self.enforce_eager = self.enforce_eager or not getattr(
             self.model, "supports_cuda_graph", True
         )
@@ -110,9 +122,7 @@ class ModelRunner:
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-
         cache_modules = []
-        fallback_dtype = next(self.model.parameters()).dtype
         block_bytes = 0
         for module in self.model.modules():
             if not (hasattr(module, "k_cache") and hasattr(module, "v_cache")):
@@ -129,8 +139,11 @@ class ModelRunner:
                     f"Invalid KV cache shape on {type(module).__name__}: "
                     f"num_kv_heads={num_kv_heads}, head_dim={head_dim}"
                 )
-            module_param = next(module.parameters(), None)
-            dtype = module_param.dtype if module_param is not None else fallback_dtype
+            dtype = getattr(module, "kv_cache_dtype", config.runtime_dtype)
+            if not isinstance(dtype, torch.dtype):
+                raise RuntimeError(
+                    f"Invalid KV cache dtype on {type(module).__name__}: {dtype!r}"
+                )
             cache_modules.append((module, num_kv_heads, head_dim, dtype))
             block_bytes += (
                 2

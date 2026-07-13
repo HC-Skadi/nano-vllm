@@ -19,11 +19,13 @@ _DEEPSEEK_V2: ModelEntry = (
 )
 
 MODEL_ARCHITECTURES: dict[str, ModelEntry] = {
+    "Qwen2ForCausalLM": _QWEN3,
     "Qwen3ForCausalLM": _QWEN3,
     "DeepseekV2ForCausalLM": _DEEPSEEK_V2,
 }
 
 MODEL_TYPES: dict[str, ModelEntry] = {
+    "qwen2": _QWEN3,
     "qwen3": _QWEN3,
     "deepseek_v2": _DEEPSEEK_V2,
 }
