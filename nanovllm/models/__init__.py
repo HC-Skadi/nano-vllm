@@ -12,21 +12,25 @@ from torch import nn
 
 ModelEntry = tuple[str, str]
 
+_QWEN2: ModelEntry = ("nanovllm.models.qwen2", "Qwen2ForCausalLM")
 _QWEN3: ModelEntry = ("nanovllm.models.qwen3", "Qwen3ForCausalLM")
+_LLAMA: ModelEntry = ("nanovllm.models.llama", "LlamaForCausalLM")
 _DEEPSEEK_V2: ModelEntry = (
     "nanovllm.models.deepseek_v2",
     "DeepseekV2ForCausalLM",
 )
 
 MODEL_ARCHITECTURES: dict[str, ModelEntry] = {
-    "Qwen2ForCausalLM": _QWEN3,
+    "Qwen2ForCausalLM": _QWEN2,
     "Qwen3ForCausalLM": _QWEN3,
+    "LlamaForCausalLM": _LLAMA,
     "DeepseekV2ForCausalLM": _DEEPSEEK_V2,
 }
 
 MODEL_TYPES: dict[str, ModelEntry] = {
-    "qwen2": _QWEN3,
+    "qwen2": _QWEN2,
     "qwen3": _QWEN3,
+    "llama": _LLAMA,
     "deepseek_v2": _DEEPSEEK_V2,
 }
 

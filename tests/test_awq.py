@@ -41,6 +41,7 @@ from nanovllm.layers.quantization.awq import (
     apply_awq_linear,
     dequantize_awq_reference,
 )
+from nanovllm.models.qwen2 import Qwen2ForCausalLM
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.utils.loader import load_model
 
@@ -286,7 +287,7 @@ class AWQModelShapeTest(unittest.TestCase):
         quant_config = AWQConfig(4, 4, True, backend="dequant")
 
         with mock_tensor_parallel(), default_dtype(torch.float16):
-            model = Qwen3ForCausalLM(config, quant_config=quant_config)
+            model = Qwen2ForCausalLM(config, quant_config=quant_config)
 
         layer = model.model.layers[0]
         qkv = layer.self_attn.qkv_proj

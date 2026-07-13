@@ -3,6 +3,8 @@ from types import SimpleNamespace
 
 from nanovllm.models import get_model_class
 from nanovllm.models.deepseek_v2 import DeepseekV2ForCausalLM
+from nanovllm.models.llama import LlamaForCausalLM
+from nanovllm.models.qwen2 import Qwen2ForCausalLM
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 
 
@@ -16,13 +18,26 @@ class ModelRegistryTest(unittest.TestCase):
 
         self.assertIs(get_model_class(config), Qwen3ForCausalLM)
 
-    def test_qwen2_uses_shared_qwen_model_implementation(self):
+    def test_selects_qwen2_model_implementation(self):
         config = SimpleNamespace(
             architectures=["Qwen2ForCausalLM"],
             model_type="qwen2",
         )
 
-        self.assertIs(get_model_class(config), Qwen3ForCausalLM)
+        self.assertIs(get_model_class(config), Qwen2ForCausalLM)
+
+    def test_selects_llama_by_architecture(self):
+        config = SimpleNamespace(
+            architectures=["LlamaForCausalLM"],
+            model_type="llama",
+        )
+
+        self.assertIs(get_model_class(config), LlamaForCausalLM)
+
+    def test_selects_llama_by_model_type(self):
+        config = SimpleNamespace(architectures=None, model_type="llama")
+
+        self.assertIs(get_model_class(config), LlamaForCausalLM)
 
     def test_accepts_single_architecture_string(self):
         config = SimpleNamespace(
