@@ -1,0 +1,162 @@
+{
+  "benchmark": "vllm_awq_fused_vs_unfused",
+  "config": {
+    "bits": 4,
+    "dense": false,
+    "dtype": "float16",
+    "effective_group_size": 128,
+    "group_size": 128,
+    "iters": 50,
+    "k": 896,
+    "m_values": [
+      1,
+      8,
+      32,
+      128,
+      256,
+      512,
+      2048
+    ],
+    "n": 9728,
+    "pack_factor": 8,
+    "seed": 0,
+    "warmup": 10
+  },
+  "created_at_utc": "2026-07-12T19:46:09.145460+00:00",
+  "environment": {
+    "compute_capability": "8.6",
+    "cuda_runtime": "12.4",
+    "gpu": "NVIDIA GeForce RTX 3060 Laptop GPU",
+    "python": "3.11.15",
+    "torch": "2.6.0+cu124",
+    "vllm": "0.8.5"
+  },
+  "method": {
+    "dense_dequantization": "not measured",
+    "latency_statistics": "median and linearly-interpolated p90",
+    "ordering": "rotated across paths on every iteration",
+    "timing": "per-call CUDA events",
+    "unfused_dequantization": "inside every timed invocation",
+    "vllm_auto_dispatch_reference": "fused for M < 256; unfused for M >= 256; this benchmark forces and reports both paths at every M"
+  },
+  "results": [
+    {
+      "fused": {
+        "median_ms": 0.03276799991726875,
+        "p90_ms": 0.03635200075805188
+      },
+      "fused_vs_unfused_error": {
+        "max_abs": 0.015625,
+        "mean_abs": 0.0009144339710474014
+      },
+      "m": 1,
+      "speedup_unfused_over_fused": 7.4374998081534605,
+      "unfused": {
+        "median_ms": 0.24371199309825897,
+        "p90_ms": 0.25855999886989595
+      }
+    },
+    {
+      "fused": {
+        "median_ms": 0.03788800165057182,
+        "p90_ms": 0.03993599861860275
+      },
+      "fused_vs_unfused_error": {
+        "max_abs": 0.015625,
+        "mean_abs": 0.0008963250438682735
+      },
+      "m": 8,
+      "speedup_unfused_over_fused": 6.878378145856003,
+      "unfused": {
+        "median_ms": 0.2606080025434494,
+        "p90_ms": 0.26316800713539124
+      }
+    },
+    {
+      "fused": {
+        "median_ms": 0.10035199671983719,
+        "p90_ms": 0.10260479748249055
+      },
+      "fused_vs_unfused_error": {
+        "max_abs": 0.03125,
+        "mean_abs": 0.00126968277618289
+      },
+      "m": 32,
+      "speedup_unfused_over_fused": 2.7551020241492012,
+      "unfused": {
+        "median_ms": 0.2764799892902374,
+        "p90_ms": 0.2826240062713623
+      }
+    },
+    {
+      "fused": {
+        "median_ms": 0.35123199224472046,
+        "p90_ms": 0.3553279936313629
+      },
+      "fused_vs_unfused_error": {
+        "max_abs": 0.015625,
+        "mean_abs": 0.0009052943787537515
+      },
+      "m": 128,
+      "speedup_unfused_over_fused": 0.86005834342351,
+      "unfused": {
+        "median_ms": 0.3020800054073334,
+        "p90_ms": 0.30423039197921753
+      }
+    },
+    {
+      "fused": {
+        "median_ms": 0.681984007358551,
+        "p90_ms": 0.6891520023345947
+      },
+      "fused_vs_unfused_error": {
+        "max_abs": 0.03125,
+        "mean_abs": 0.0009011424263007939
+      },
+      "m": 256,
+      "speedup_unfused_over_fused": 0.6231230979270469,
+      "unfused": {
+        "median_ms": 0.4249599874019623,
+        "p90_ms": 0.43110400438308716
+      }
+    },
+    {
+      "fused": {
+        "median_ms": 1.3255679607391357,
+        "p90_ms": 1.3425663709640503
+      },
+      "fused_vs_unfused_error": {
+        "max_abs": 0.015625,
+        "mean_abs": 0.000901374383829534
+      },
+      "m": 512,
+      "speedup_unfused_over_fused": 0.45577445193967087,
+      "unfused": {
+        "median_ms": 0.6041600108146667,
+        "p90_ms": 0.6113280057907104
+      }
+    },
+    {
+      "fused": {
+        "median_ms": 5.422080039978027,
+        "p90_ms": 5.438668966293335
+      },
+      "fused_vs_unfused_error": {
+        "max_abs": 0.03125,
+        "mean_abs": 0.0009050849475897849
+      },
+      "m": 2048,
+      "speedup_unfused_over_fused": 0.33446647177195593,
+      "unfused": {
+        "median_ms": 1.8135039806365967,
+        "p90_ms": 1.8217984437942505
+      }
+    }
+  ],
+  "source": {
+    "awq_file_commit": "4d591db470c0b53304f9dd2369d4feb8275a94bc",
+    "fused": "vllm._custom_ops.awq_gemm(x, qweight, scales, qzeros, 8)",
+    "unfused": "vllm._custom_ops.awq_dequantize(qweight, scales, qzeros, 0, 0, 0) + torch.matmul",
+    "url": "https://github.com/vllm-project/vllm/blob/4d591db470c0b53304f9dd2369d4feb8275a94bc/vllm/model_executor/layers/quantization/awq.py"
+  }
+}
