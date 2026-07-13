@@ -16,11 +16,18 @@ A lightweight vLLM implementation built from scratch.
 * 📖 **Readable codebase** - Clean implementation in ~ 1,200 lines of Python code
 * ⚡ **Optimization Suite** - Prefix caching, Tensor Parallelism, Torch compilation, CUDA graph, etc.
 * 🤖 **MoE model support** - Correctness-first BF16 inference for DeepSeek-V2-Lite and DeepSeek-V2-Lite-Chat
+* 📦 **Qwen AWQ** - W4A16 inference for standard GEMM-format Qwen2/Qwen2.5/Qwen3 checkpoints
 
 ## Installation
 
 ```bash
 pip install git+https://github.com/GeeeekExplorer/nano-vllm.git
+```
+
+Install the optional vLLM kernels when running AWQ models:
+
+```bash
+pip install -e '.[awq]'
 ```
 
 ## Model Download
@@ -55,9 +62,36 @@ example, `2048`) to limit warm-up and prefill memory.
 See [MoE and DeepSeek support](docs/moe.md) for the support matrix, current
 limitations, model download command, and an `LLM` example.
 
+## Qwen AWQ
+
+Standard AutoAWQ W4/GEMM checkpoints are detected from their Hugging Face
+`quantization_config`. The default `auto` backend follows vLLM's dispatch:
+fused `awq_gemm` below 256 tokens and `awq_dequantize + torch.matmul` for larger
+token batches.
+
+```python
+from nanovllm import LLM, SamplingParams
+
+llm = LLM(
+    "/YOUR/Qwen2.5-0.5B-Instruct-AWQ",
+    awq_backend="auto",       # auto | gemm | dequant
+    enforce_eager=True,
+)
+outputs = llm.generate(["Hello"], SamplingParams(max_tokens=32))
+```
+
+See [docs/awq.md](docs/awq.md) for the supported format, correctness checks,
+limitations, and fused-vs-unfused benchmark results.
+
 ## Benchmark
 
 See `bench.py` for benchmark.
+
+For an operator-level AWQ comparison using identical packed weights, run:
+
+```bash
+python bench_awq.py --dense
+```
 
 **Test Configuration:**
 - Hardware: RTX 4070 Laptop (8GB)
