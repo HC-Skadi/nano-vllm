@@ -54,13 +54,21 @@ outputs[0]["text"]
 ## MoE / DeepSeek
 
 The first MoE model path targets the BF16 DeepSeek-V2-Lite and
-DeepSeek-V2-Lite-Chat checkpoints. It supports top-k and shared experts, MLA
-with expanded K/V caching, YaRN, tensor parallelism, and eager execution. Use
+DeepSeek-V2-Lite-Chat checkpoints. It supports top-k and shared experts,
+weight-absorbed MLA with a native latent KV cache, YaRN, tensor parallelism,
+and eager execution. Use
 `enforce_eager=True` and start with a smaller `max_num_batched_tokens` (for
 example, `2048`) to limit warm-up and prefill memory.
 
 See [MoE and DeepSeek support](docs/moe.md) for the support matrix, current
-limitations, model download command, and an `LLM` example.
+limitations, model download command, an `LLM` example, and reproducible
+expanded-vs-latent MLA benchmarks.
+
+On an A100 40GB/80GB, run the complete comparison with:
+
+```bash
+./run_deepseek_mla_a100.sh /YOUR/DeepSeek-V2-Lite-Chat/PATH
+```
 
 ## Qwen AWQ
 

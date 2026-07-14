@@ -8,6 +8,8 @@ from nanovllm.layers.attention import (
     flash_attn_with_kvcache,
     store_kvcache,
 )
+from nanovllm.layers.mla import LatentMLAAttention
+from nanovllm.utils.context import reset_context, set_context
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
@@ -17,7 +19,98 @@ class DeepseekKVCacheCudaTest(unittest.TestCase):
     head_dim = 192
 
     def assert_close(self, actual, expected):
-        torch.testing.assert_close(actual, expected, atol=5e-3, rtol=5e-3)
+        # BF16 contractions can differ by one or two ULPs when the eager
+        # reference and Triton/batched-GEMM paths accumulate in a different
+        # order.  The RTX 3060 observed worst-case absolute error is 0.015625.
+        torch.testing.assert_close(actual, expected, atol=2e-2, rtol=1e-2)
+
+    def tearDown(self):
+        reset_context()
+
+    def test_native_latent_cache_matches_full_attention_at_lite_dimensions(self):
+        torch.manual_seed(0)
+        num_heads = 2
+        latent_dim = 512
+        rope_dim = 64
+        total_tokens = 8
+        module = LatentMLAAttention(
+            num_heads,
+            latent_dim,
+            rope_dim,
+            (128 + rope_dim) ** -0.5,
+        ).cuda()
+        query_latent = torch.randn(
+            total_tokens,
+            num_heads,
+            latent_dim,
+            device="cuda",
+            dtype=self.dtype,
+        )
+        query_rope = torch.randn(
+            total_tokens,
+            num_heads,
+            rope_dim,
+            device="cuda",
+            dtype=self.dtype,
+        )
+        latent = torch.randn(
+            total_tokens, latent_dim, device="cuda", dtype=self.dtype
+        )
+        key_rope = torch.randn(
+            total_tokens, rope_dim, device="cuda", dtype=self.dtype
+        )
+
+        expected = module(query_latent, query_rope, latent, key_rope)
+        module.k_cache = torch.zeros(
+            1,
+            256,
+            1,
+            latent_dim + rope_dim,
+            device="cuda",
+            dtype=self.dtype,
+        )
+
+        set_context(
+            True,
+            cu_seqlens_q=torch.tensor([0, 5], device="cuda", dtype=torch.int32),
+            cu_seqlens_k=torch.tensor([0, 5], device="cuda", dtype=torch.int32),
+            max_seqlen_q=5,
+            max_seqlen_k=5,
+            slot_mapping=torch.arange(5, device="cuda", dtype=torch.int32),
+        )
+        prefill = module(
+            query_latent[:5], query_rope[:5], latent[:5], key_rope[:5]
+        )
+
+        set_context(
+            True,
+            cu_seqlens_q=torch.tensor([0, 2], device="cuda", dtype=torch.int32),
+            cu_seqlens_k=torch.tensor([0, 7], device="cuda", dtype=torch.int32),
+            max_seqlen_q=2,
+            max_seqlen_k=7,
+            slot_mapping=torch.tensor([5, 6], device="cuda", dtype=torch.int32),
+            block_tables=torch.tensor([[0]], device="cuda", dtype=torch.int32),
+        )
+        prefix = module(
+            query_latent[5:7], query_rope[5:7], latent[5:7], key_rope[5:7]
+        )
+
+        set_context(
+            False,
+            slot_mapping=torch.tensor([7], device="cuda", dtype=torch.int32),
+            context_lens=torch.tensor([8], device="cuda", dtype=torch.int32),
+            block_tables=torch.tensor([[0]], device="cuda", dtype=torch.int32),
+        )
+        decode = module(
+            query_latent[7:], query_rope[7:], latent[7:], key_rope[7:]
+        )
+
+        self.assert_close(prefill, expected[:5])
+        self.assert_close(prefix, expected[5:7])
+        self.assert_close(decode, expected[7:])
+        cached = module.k_cache.view(-1, latent_dim + rope_dim)[:total_tokens]
+        self.assert_close(cached[:, :latent_dim], latent)
+        self.assert_close(cached[:, latent_dim:], key_rope)
 
     def test_store_supports_non_power_of_two_expanded_mla_width(self):
         num_tokens = 3

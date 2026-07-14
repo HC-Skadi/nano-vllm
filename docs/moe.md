@@ -13,9 +13,10 @@ implementation first; it is not a performance-optimized MoE backend.
 ## Supported in the first version
 
 - Model-configured top-k routed experts and shared experts.
-- DeepSeek Multi-head Latent Attention (MLA). The latent projections are
-  expanded into ordinary per-head keys and values before attention, so the
-  existing paged-attention implementation can be reused.
+- DeepSeek Multi-head Latent Attention (MLA) with weight absorption. The paged
+  cache stores the normalized KV latent and decoupled RoPE key once per token;
+  `W_UK` is applied on the query side and `W_UV` after latent attention, so
+  cached tokens are not expanded into per-head keys and values.
 - DeepSeek's YaRN rotary-position scaling configuration.
 - Tensor parallelism through `tensor_parallel_size`, subject to the usual
   divisibility requirements of the model dimensions. This is tensor
@@ -28,14 +29,84 @@ implementation first; it is not a performance-optimized MoE backend.
 - Expert parallelism.
 - A fused MoE dispatch/expert kernel.
 - CUDA Graph execution for the DeepSeek/MoE model path.
-- A native latent MLA KV cache. Nano-vLLM currently stores expanded K/V tensors
-  in its regular paged KV cache.
+- A fused Triton/CUDA kernel for latent MLA attention. The current
+  correctness-first implementation uses PyTorch tensor operations over the
+  native paged latent cache.
 
-Expanded K/V is simpler to inspect and validate, but uses more KV-cache memory
-than a native latent-cache implementation. MoE weights also need to be resident
-even though only a subset of routed experts is active for each token. Plan
-memory from the model's total parameter count, not only its active parameter
-count.
+MoE weights need to be resident even though only a subset of routed experts is
+active for each token. Plan memory from the model's total parameter count, not
+only its active parameter count.
+
+## Compare expanded and weight-absorbed MLA
+
+The pre-optimization expanded-KV path remains available as a benchmark
+baseline. Run both backends in isolated processes with a fixed cache capacity:
+
+```bash
+python bench_deepseek_mla.py \
+  --model ~/huggingface/DeepSeek-V2-Lite-Chat \
+  --requests 8 \
+  --input-tokens 512 \
+  --output-tokens 128 \
+  --repeats 3 \
+  --json benchmarks/deepseek_mla.json
+```
+
+The report includes TTFT, TPOT, prefill/decode throughput, cache allocation,
+and sampled-token agreement. The two backends use the same checkpoint, prompt
+token IDs, fixed cache-block count, eager mode, and BF16 runtime. Use
+`deepseek_mla_backend="expanded"` or `"latent"` on `LLM` to select one path
+directly.
+
+For a GPU that cannot hold the complete 16B BF16 checkpoint, run the real Lite
+attention dimensions as a one-layer decode benchmark:
+
+```bash
+python bench_deepseek_mla_ops.py \
+  --cases 1:128 1:1024 8:1024 \
+  --warmup 10 \
+  --repeats 50 \
+  --json benchmarks/deepseek_mla_rtx3060.json
+```
+
+Measured on an NVIDIA GeForce RTX 3060 Laptop GPU in BF16:
+
+| Batch | Context | Expanded | Latent | Relative throughput | Expanded cache | Latent cache |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 128 | 1.384 ms | 2.260 ms | 0.612x | 3.00 MiB | 0.28 MiB |
+| 1 | 1024 | 1.396 ms | 2.271 ms | 0.615x | 12.00 MiB | 1.12 MiB |
+| 8 | 1024 | 2.160 ms | 2.739 ms | 0.788x | 96.00 MiB | 9.00 MiB |
+
+The latent cache is 90.62% smaller and output cosine similarity is above
+0.99998 in these cases. The current PyTorch latent implementation is not yet a
+latency optimization: it remains slower than the fused Triton expanded-KV
+baseline. A fused latent MLA decode kernel is required before claiming a decode
+throughput improvement. Raw results are stored in
+`benchmarks/deepseek_mla_rtx3060.json`.
+
+### One-command A100 run
+
+For a single A100 40GB or 80GB with a local checkpoint, run:
+
+```bash
+./run_deepseek_mla_a100.sh /models/DeepSeek-V2-Lite-Chat
+```
+
+The script checks GPU memory, PyTorch CUDA/BF16 support, and checkpoint files.
+It then runs a real-dimension operator benchmark, a full-model smoke test, and
+an end-to-end matrix. A100 80GB uses batch 8 and a 4096-token long-context
+case; A100 40GB uses batch 4 and 2048 tokens. Results, logs, and environment
+metadata are written to a timestamped `benchmarks/a100_*` directory.
+
+Useful overrides:
+
+```bash
+PROFILE=smoke REPEATS=1 \
+  ./run_deepseek_mla_a100.sh /models/DeepSeek-V2-Lite-Chat
+
+PROFILE=full REPEATS=5 OUTPUT_DIR=/results/mla-a100 \
+  ./run_deepseek_mla_a100.sh /models/DeepSeek-V2-Lite-Chat
+```
 
 ## Download a checkpoint
 

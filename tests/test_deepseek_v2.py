@@ -17,6 +17,7 @@ from nanovllm.models.deepseek_v2 import (
     DeepseekV2RotaryEmbedding,
     yarn_get_mscale,
 )
+from nanovllm.utils.context import reset_context, set_context
 from nanovllm.utils.loader import load_model
 
 
@@ -76,14 +77,16 @@ class CaptureAttention(nn.Module):
 
     def forward(
         self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
+        query_latent: torch.Tensor,
+        query_rope: torch.Tensor,
+        latent: torch.Tensor,
+        key_rope: torch.Tensor,
     ) -> torch.Tensor:
-        self.query = query.detach().clone()
-        self.key = key.detach().clone()
-        self.value = value.detach().clone()
-        return value
+        self.query_latent = query_latent.detach().clone()
+        self.query_rope = query_rope.detach().clone()
+        self.latent = latent.detach().clone()
+        self.key_rope = key_rope.detach().clone()
+        return latent.unsqueeze(1).expand(-1, query_latent.shape[1], -1)
 
 
 class CausalReferenceAttention(nn.Module):
@@ -93,21 +96,17 @@ class CausalReferenceAttention(nn.Module):
         self.scale = scale
 
     def forward(self, query, key, value):
-        query = query.transpose(0, 1)
-        key = key.transpose(0, 1)
-        value = value.transpose(0, 1)
-        scores = torch.matmul(query, key.transpose(-1, -2)) * self.scale
-        causal_mask = torch.triu(
+        scores = torch.einsum("qhd,khd->hqk", query, key).float() * self.scale
+        mask = torch.triu(
             torch.ones(
-                scores.shape[-2:], device=scores.device, dtype=torch.bool
+                query.shape[0], key.shape[0], device=query.device, dtype=torch.bool
             ),
             diagonal=1,
         )
-        scores = scores.masked_fill(causal_mask, float("-inf"))
-        probabilities = torch.softmax(scores, dim=-1, dtype=torch.float32).to(
-            query.dtype
-        )
-        return torch.matmul(probabilities, value).transpose(0, 1)
+        probabilities = torch.softmax(
+            scores.masked_fill(mask, float("-inf")), dim=-1
+        ).to(value.dtype)
+        return torch.einsum("hqk,khd->qhd", probabilities, value)
 
 
 class EagerRMSNorm(nn.Module):
@@ -132,6 +131,10 @@ class DeepseekV2Test(unittest.TestCase):
 
     def setUp(self):
         torch.manual_seed(0)
+        reset_context()
+
+    def tearDown(self):
+        reset_context()
 
     def test_tiny_config_selects_dense_then_moe_layers(self):
         with single_rank_dist():
@@ -210,7 +213,7 @@ class DeepseekV2Test(unittest.TestCase):
         torch.testing.assert_close(actual_query, reference(query))
         torch.testing.assert_close(actual_key, reference(key))
 
-    def test_mla_shapes_partial_rope_and_value_padding(self):
+    def test_mla_absorbs_key_projection_and_keeps_latent_kv(self):
         config = tiny_config()
         with single_rank_dist():
             attention = DeepseekV2Attention(config)
@@ -233,19 +236,17 @@ class DeepseekV2Test(unittest.TestCase):
         )
         output = attention(positions, hidden_states)
 
-        self.assertEqual(capture.query.shape, (3, 4, 12))
-        self.assertEqual(capture.key.shape, (3, 4, 12))
-        self.assertEqual(capture.value.shape, (3, 4, 12))
-        self.assertEqual(output.shape, (3, config.hidden_size))
-        torch.testing.assert_close(capture.query[..., :8], raw_query[..., :8])
-        torch.testing.assert_close(capture.query[..., 8:], expected_rotary)
-        torch.testing.assert_close(
-            capture.value[..., 8:], torch.zeros_like(capture.value[..., 8:])
+        up_weights = attention.kv_b_proj.weight.view(4, 16, 8)
+        expected_query_latent = torch.einsum(
+            "thn,hnl->thl", raw_query[..., :8], up_weights[:, :8]
         )
-        for head in range(1, config.num_attention_heads):
-            torch.testing.assert_close(
-                capture.key[:, head, 8:], capture.key[:, 0, 8:]
-            )
+        self.assertEqual(capture.query_latent.shape, (3, 4, 8))
+        self.assertEqual(capture.query_rope.shape, (3, 4, 4))
+        self.assertEqual(capture.latent.shape, (3, 8))
+        self.assertEqual(capture.key_rope.shape, (3, 4))
+        self.assertEqual(output.shape, (3, config.hidden_size))
+        torch.testing.assert_close(capture.query_latent, expected_query_latent)
+        torch.testing.assert_close(capture.query_rope, expected_rotary)
 
     def test_mla_matches_self_contained_eager_reference(self):
         config = tiny_config()
@@ -253,7 +254,6 @@ class DeepseekV2Test(unittest.TestCase):
             attention = DeepseekV2Attention(config)
         eager_norm = EagerRMSNorm(config.kv_lora_rank, config.rms_norm_eps)
         attention.kv_a_layernorm = eager_norm
-        attention.attn = CausalReferenceAttention(attention.attn.scale)
         with torch.no_grad():
             for parameter in attention.parameters():
                 parameter.uniform_(-0.15, 0.15)
@@ -321,6 +321,153 @@ class DeepseekV2Test(unittest.TestCase):
             )
 
         torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-6)
+
+    def test_latent_backend_matches_expanded_backend(self):
+        latent_config = tiny_config(deepseek_mla_backend="latent")
+        expanded_config = tiny_config(deepseek_mla_backend="expanded")
+        with single_rank_dist():
+            latent = DeepseekV2Attention(latent_config)
+            expanded = DeepseekV2Attention(expanded_config)
+        expanded.load_state_dict(latent.state_dict())
+        expanded.attn = CausalReferenceAttention(expanded.attn.scale)
+
+        with torch.no_grad():
+            for parameter in latent.parameters():
+                parameter.uniform_(-0.15, 0.15)
+            expanded.load_state_dict(latent.state_dict())
+            hidden_states = torch.randn(7, latent_config.hidden_size)
+            positions = torch.arange(7)
+            latent_output = latent(positions, hidden_states)
+            expanded_output = expanded(positions, hidden_states)
+
+        torch.testing.assert_close(
+            latent_output, expanded_output, rtol=2e-5, atol=2e-6
+        )
+
+    def test_weight_absorption_respects_tensor_parallel_head_partition(self):
+        config = tiny_config()
+        with (
+            patch("torch.distributed.get_world_size", return_value=2),
+            patch("torch.distributed.get_rank", return_value=1),
+            patch("torch.distributed.all_reduce"),
+        ):
+            attention = DeepseekV2Attention(config)
+            with torch.no_grad():
+                for parameter in attention.parameters():
+                    parameter.uniform_(-0.15, 0.15)
+
+            hidden_states = torch.randn(4, config.hidden_size)
+            positions = torch.arange(4)
+            with torch.no_grad():
+                actual = attention(positions, hidden_states)
+
+                query = torch.nn.functional.linear(
+                    hidden_states, attention.q_proj.weight
+                ).view(4, 2, 12)
+                query_nope, query_rope = query.split([8, 4], dim=-1)
+                compressed = torch.nn.functional.linear(
+                    hidden_states, attention.kv_a_proj_with_mqa.weight
+                )
+                latent, key_rope = compressed.split([8, 4], dim=-1)
+                latent = attention.kv_a_layernorm(latent)
+                expanded = torch.nn.functional.linear(
+                    latent, attention.kv_b_proj.weight
+                ).view(4, 2, 16)
+                key_nope, value = expanded.split([8, 8], dim=-1)
+                query_rope, key_rope = attention.rotary_emb(
+                    positions, query_rope, key_rope.view(4, 1, 4)
+                )
+                query = torch.cat((query_nope, query_rope), dim=-1)
+                key = torch.cat((key_nope, key_rope.expand(-1, 2, -1)), dim=-1)
+                scores = torch.einsum("qhd,khd->hqk", query, key)
+                scores = scores.float() * attention.attn.scale
+                mask = torch.triu(torch.ones(4, 4, dtype=torch.bool), diagonal=1)
+                probabilities = torch.softmax(
+                    scores.masked_fill(mask, float("-inf")), dim=-1
+                ).to(value.dtype)
+                heads = torch.einsum("hqk,khd->qhd", probabilities, value)
+                expected = torch.nn.functional.linear(
+                    heads.flatten(1), attention.o_proj.weight
+                )
+
+        self.assertEqual(attention.num_heads, 2)
+        torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-6)
+
+    def test_native_latent_cache_prefill_prefix_and_decode_match_full_sequence(self):
+        config = tiny_config()
+        with single_rank_dist():
+            attention = DeepseekV2Attention(config)
+        with torch.no_grad():
+            for parameter in attention.parameters():
+                parameter.uniform_(-0.1, 0.1)
+
+        hidden_states = torch.randn(6, config.hidden_size)
+        positions = torch.arange(6)
+        block_size = 8
+        attention.attn.k_cache = torch.zeros(
+            1,
+            block_size,
+            1,
+            config.kv_lora_rank + config.qk_rope_head_dim,
+        )
+        attention.attn.v_cache = torch.empty(0)
+
+        set_context(
+            True,
+            cu_seqlens_q=torch.tensor([0, 3], dtype=torch.int32),
+            cu_seqlens_k=torch.tensor([0, 3], dtype=torch.int32),
+            max_seqlen_q=3,
+            max_seqlen_k=3,
+            slot_mapping=torch.tensor([0, 1, 2], dtype=torch.int32),
+        )
+        with torch.no_grad():
+            attention(positions[:3], hidden_states[:3])
+
+        compressed = attention.kv_a_proj_with_mqa(hidden_states[:3])
+        raw_latent, raw_rope = compressed.split([8, 4], dim=-1)
+        expected_latent = attention.kv_a_layernorm(raw_latent)
+        _, expected_rope = attention.rotary_emb(
+            positions[:3],
+            torch.zeros(3, config.num_attention_heads, 4),
+            raw_rope.view(3, 1, 4),
+        )
+        expected_entry = torch.cat(
+            (expected_latent, expected_rope.squeeze(1)), dim=-1
+        )
+        torch.testing.assert_close(
+            attention.attn.k_cache.view(-1, 12)[:3], expected_entry
+        )
+        self.assertEqual(attention.attn.v_cache.numel(), 0)
+
+        # Prefix-prefill two more tokens.  The queries must attend to the three
+        # cached tokens plus their causal portion of the new chunk.
+        set_context(
+            True,
+            cu_seqlens_q=torch.tensor([0, 2], dtype=torch.int32),
+            cu_seqlens_k=torch.tensor([0, 5], dtype=torch.int32),
+            max_seqlen_q=2,
+            max_seqlen_k=5,
+            slot_mapping=torch.tensor([3, 4], dtype=torch.int32),
+            block_tables=torch.tensor([[0]], dtype=torch.int32),
+        )
+        with torch.no_grad():
+            prefix_output = attention(positions[3:5], hidden_states[3:5])
+
+        # Decode the sixth token from the same native cache.
+        set_context(
+            False,
+            slot_mapping=torch.tensor([5], dtype=torch.int32),
+            context_lens=torch.tensor([6], dtype=torch.int32),
+            block_tables=torch.tensor([[0]], dtype=torch.int32),
+        )
+        with torch.no_grad():
+            decode_output = attention(positions[5:], hidden_states[5:])
+
+        reset_context()
+        with torch.no_grad():
+            full_output = attention(positions, hidden_states)
+        torch.testing.assert_close(prefix_output, full_output[3:5])
+        torch.testing.assert_close(decode_output, full_output[5:])
 
     def test_router_uses_fp32_softmax_without_topk_renormalization(self):
         config = tiny_config(routed_scaling_factor=1.75)

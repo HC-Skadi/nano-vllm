@@ -118,6 +118,7 @@ class ModelRunner:
 
     def allocate_kv_cache(self):
         config = self.config
+        requested_blocks = config.num_kvcache_blocks
         free, total = torch.cuda.mem_get_info()
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
@@ -144,9 +145,17 @@ class ModelRunner:
                 raise RuntimeError(
                     f"Invalid KV cache dtype on {type(module).__name__}: {dtype!r}"
                 )
-            cache_modules.append((module, num_kv_heads, head_dim, dtype))
+            cache_count = int(getattr(module, "kv_cache_count", 2))
+            if cache_count not in (1, 2):
+                raise RuntimeError(
+                    f"Invalid cache tensor count on {type(module).__name__}: "
+                    f"{cache_count}"
+                )
+            cache_modules.append(
+                (module, num_kv_heads, head_dim, dtype, cache_count)
+            )
             block_bytes += (
-                2
+                cache_count
                 * self.block_size
                 * num_kv_heads
                 * head_dim
@@ -159,7 +168,15 @@ class ModelRunner:
         available_bytes = int(
             total * config.gpu_memory_utilization - used - peak + current
         )
-        num_kvcache_blocks = available_bytes // block_bytes
+        capacity_blocks = available_bytes // block_bytes
+        if requested_blocks > capacity_blocks:
+            raise RuntimeError(
+                f"Requested {requested_blocks} KV-cache blocks, but only "
+                f"{capacity_blocks} fit in the configured GPU memory budget"
+            )
+        num_kvcache_blocks = (
+            requested_blocks if requested_blocks > 0 else capacity_blocks
+        )
         if self.world_size > 1:
             # The scheduler runs on rank 0, so every TP rank must expose the same
             # physical block range. Use the most constrained GPU when free
@@ -172,7 +189,7 @@ class ModelRunner:
         config.num_kvcache_blocks = num_kvcache_blocks
         assert config.num_kvcache_blocks > 0
         self.kv_cache = []
-        for module, num_kv_heads, head_dim, dtype in cache_modules:
+        for module, num_kv_heads, head_dim, dtype, cache_count in cache_modules:
             cache_shape = (
                 config.num_kvcache_blocks,
                 self.block_size,
@@ -180,7 +197,11 @@ class ModelRunner:
                 head_dim,
             )
             k_cache = torch.empty(cache_shape, dtype=dtype)
-            v_cache = torch.empty(cache_shape, dtype=dtype)
+            v_cache = (
+                torch.empty(cache_shape, dtype=dtype)
+                if cache_count == 2
+                else torch.empty(0, dtype=dtype)
+            )
             module.k_cache = k_cache
             module.v_cache = v_cache
             self.kv_cache.append((k_cache, v_cache))
@@ -226,12 +247,25 @@ class ModelRunner:
                 slot_mapping.extend(range(slot_start, slot_end))
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
+        host_cu_seqlens_q = tuple(cu_seqlens_q)
+        host_cu_seqlens_k = tuple(cu_seqlens_k)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        set_context(
+            True,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            slot_mapping,
+            None,
+            block_tables,
+            host_cu_seqlens_q=host_cu_seqlens_q,
+            host_cu_seqlens_k=host_cu_seqlens_k,
+        )
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -244,12 +278,19 @@ class ModelRunner:
             positions.append(len(seq) - 1)
             context_lens.append(len(seq))
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
+        host_context_lens = tuple(context_lens)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        set_context(
+            False,
+            slot_mapping=slot_mapping,
+            context_lens=context_lens,
+            block_tables=block_tables,
+            host_context_lens=host_context_lens,
+        )
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):

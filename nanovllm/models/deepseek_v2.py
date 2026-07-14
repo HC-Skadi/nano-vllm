@@ -16,6 +16,7 @@ from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.attention import Attention
 from nanovllm.layers.embed_head import ParallelLMHead, VocabParallelEmbedding
 from nanovllm.layers.layernorm import RMSNorm
+from nanovllm.layers.mla import LatentMLAAttention
 from nanovllm.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -290,7 +291,7 @@ class DeepseekV2MoE(SparseMoE):
 
 
 class DeepseekV2Attention(nn.Module):
-    """Expanded-KV implementation of DeepSeek-V2 MLA."""
+    """Weight-absorbed DeepSeek-V2 MLA with a native latent KV cache."""
 
     def __init__(self, config) -> None:
         super().__init__()
@@ -306,9 +307,15 @@ class DeepseekV2Attention(nn.Module):
         self.qk_rope_head_dim = config.qk_rope_head_dim
         self.qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         self.v_head_dim = config.v_head_dim
-        if self.v_head_dim > self.qk_head_dim:
-            raise ValueError("v_head_dim cannot exceed the expanded Q/K head size")
-
+        self.mla_backend = getattr(config, "deepseek_mla_backend", "latent")
+        if self.mla_backend not in {"expanded", "latent"}:
+            raise ValueError(
+                f"unsupported DeepSeek MLA backend: {self.mla_backend!r}"
+            )
+        if self.mla_backend == "expanded" and self.v_head_dim > self.qk_head_dim:
+            raise ValueError(
+                "expanded MLA requires v_head_dim <= qk_head_dim"
+            )
         attention_bias = bool(getattr(config, "attention_bias", False))
         if self.q_lora_rank is None:
             self.q_proj = ColumnParallelLinear(
@@ -364,12 +371,20 @@ class DeepseekV2Attention(nn.Module):
                 float(rope_scaling["mscale_all_dim"]),
             )
             scaling *= mscale * mscale
-        self.attn = Attention(
-            self.num_heads,
-            self.qk_head_dim,
-            scaling,
-            self.num_heads,
-        )
+        if self.mla_backend == "latent":
+            self.attn = LatentMLAAttention(
+                self.num_heads,
+                self.kv_lora_rank,
+                self.qk_rope_head_dim,
+                scaling,
+            )
+        else:
+            self.attn = Attention(
+                self.num_heads,
+                self.qk_head_dim,
+                scaling,
+                self.num_heads,
+            )
 
     def forward(
         self,
@@ -392,28 +407,57 @@ class DeepseekV2Attention(nn.Module):
             [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
         )
         key_rope = key_rope.view(-1, 1, self.qk_rope_head_dim)
-        expanded_kv = self.kv_b_proj(
-            self.kv_a_layernorm(compressed_kv)
-        ).view(
-            -1,
-            self.num_heads,
-            self.qk_nope_head_dim + self.v_head_dim,
-        )
-        key_nope, value = expanded_kv.split(
-            [self.qk_nope_head_dim, self.v_head_dim], dim=-1
-        )
+        latent = self.kv_a_layernorm(compressed_kv)
         query_rope, key_rope = self.rotary_emb(
             positions, query_rope, key_rope
         )
-        key_rope = key_rope.expand(-1, self.num_heads, -1)
-        query = torch.cat((query_nope, query_rope), dim=-1)
-        key = torch.cat((key_nope, key_rope), dim=-1)
-        if self.v_head_dim != self.qk_head_dim:
-            value = F.pad(value, (0, self.qk_head_dim - self.v_head_dim))
+        key_rope = key_rope.squeeze(1)
 
-        output = self.attn(query, key, value)
-        output = output[..., : self.v_head_dim]
-        return self.o_proj(output.flatten(1, -1))
+        if self.mla_backend == "expanded":
+            expanded_kv = self.kv_b_proj(latent).view(
+                -1,
+                self.num_heads,
+                self.qk_nope_head_dim + self.v_head_dim,
+            )
+            key_nope, value = expanded_kv.split(
+                [self.qk_nope_head_dim, self.v_head_dim], dim=-1
+            )
+            query = torch.cat((query_nope, query_rope), dim=-1)
+            key = torch.cat(
+                (
+                    key_nope,
+                    key_rope.unsqueeze(1).expand(-1, self.num_heads, -1),
+                ),
+                dim=-1,
+            )
+            if self.v_head_dim != self.qk_head_dim:
+                value = F.pad(value, (0, self.qk_head_dim - self.v_head_dim))
+            output = self.attn(query, key, value)
+            output = output[..., : self.v_head_dim]
+            return self.o_proj(output.flatten(1, -1))
+
+        # kv_b_proj is laid out per TP-local head as [W_UK; W_UV].  Moving
+        # W_UK to the query side means cached tokens remain in kv_lora_rank;
+        # moving W_UV after attention avoids ever materializing cached values.
+        up_weights = self.kv_b_proj.weight.view(
+            self.num_heads,
+            self.qk_nope_head_dim + self.v_head_dim,
+            self.kv_lora_rank,
+        )
+        key_up_weight, value_up_weight = up_weights.split(
+            [self.qk_nope_head_dim, self.v_head_dim], dim=1
+        )
+        query_latent = torch.bmm(
+            query_nope.transpose(0, 1), key_up_weight
+        ).transpose(0, 1)
+        latent_output = self.attn(
+            query_latent, query_rope, latent, key_rope
+        )
+        value_output = torch.bmm(
+            latent_output.transpose(0, 1),
+            value_up_weight.transpose(1, 2),
+        ).transpose(0, 1)
+        return self.o_proj(value_output.flatten(1, -1))
 
 
 class DeepseekV2DecoderLayer(nn.Module):

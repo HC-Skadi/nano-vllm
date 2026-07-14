@@ -30,6 +30,8 @@ class Config:
     # 量化方式和 AWQ kernel 后端；默认从 checkpoint 自动识别。
     quantization: str | None = None
     awq_backend: str = "auto"
+    # DeepSeek MLA 后端：expanded 是优化前基线，latent 启用权重吸收。
+    deepseek_mla_backend: str = "latent"
     # Hugging Face 模型配置，初始化时根据 model 自动加载。
     hf_config: AutoConfig | None = None
     # 结束符 token id，调度后处理阶段用它判断序列是否完成。
@@ -51,6 +53,17 @@ class Config:
         self.hf_config = AutoConfig.from_pretrained(
             self.model,
             trust_remote_code=self.trust_remote_code,
+        )
+        self.deepseek_mla_backend = self.deepseek_mla_backend.lower()
+        if self.deepseek_mla_backend not in {"expanded", "latent"}:
+            raise ValueError(
+                "deepseek_mla_backend must be 'expanded' or 'latent', got "
+                f"{self.deepseek_mla_backend!r}"
+            )
+        setattr(
+            self.hf_config,
+            "deepseek_mla_backend",
+            self.deepseek_mla_backend,
         )
         # 不能超过模型自身支持的最大位置编码长度。
         architectures = set(getattr(self.hf_config, "architectures", []) or [])
