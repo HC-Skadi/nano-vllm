@@ -271,6 +271,7 @@ def main() -> None:
         max_num_batched_tokens=max(max_requests * max(inp for _, inp, _ in scenarios), max_context),
         gpu_memory_utilization=args.gpu_memory_utilization,
         deepseek_mla_backend=args.backend,
+        trust_remote_code=True,
     )
     torch.cuda.synchronize()
     initialization_seconds = time.perf_counter() - initialization_started

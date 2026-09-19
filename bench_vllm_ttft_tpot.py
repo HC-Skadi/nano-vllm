@@ -38,7 +38,7 @@ async def run_scenario(engine, prompts, sampling_params, tag):
     counts: dict[str, int] = {}
 
     async def one(prompt, rid):
-        from vllm import TokensPrompt
+        from vllm.inputs import TokensPrompt
         async for output in engine.generate(
             TokensPrompt(prompt_token_ids=prompt), sampling_params, rid
         ):
@@ -71,8 +71,12 @@ async def run_scenario(engine, prompts, sampling_params, tag):
 
 
 async def amain(args):
-    from vllm import AsyncLLM, SamplingParams
+    from vllm import SamplingParams
     from vllm.engine.arg_utils import AsyncEngineArgs
+    try:
+        from vllm import AsyncLLM
+    except ImportError:
+        from vllm.v1.engine.async_llm import AsyncLLM
 
     engine_args = AsyncEngineArgs(
         model=args.model,
@@ -88,9 +92,9 @@ async def amain(args):
         trust_remote_code=True,
     )
     try:
-        engine = AsyncLLM(engine_args=engine_args)
-    except TypeError:
         engine = AsyncLLM.from_engine_args(engine_args)
+    except (TypeError, AttributeError):
+        engine = AsyncLLM(engine_args=engine_args)
     config = json.loads((Path(args.model) / "config.json").read_text())
     vocab_size = int(config["vocab_size"])
 
