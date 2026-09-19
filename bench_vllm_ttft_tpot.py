@@ -87,7 +87,10 @@ async def amain(args):
         gpu_memory_utilization=args.gpu_memory_utilization,
         trust_remote_code=True,
     )
-    engine = AsyncLLM(engine_args=engine_args)
+    try:
+        engine = AsyncLLM(engine_args=engine_args)
+    except TypeError:
+        engine = AsyncLLM.from_engine_args(engine_args)
     config = json.loads((Path(args.model) / "config.json").read_text())
     vocab_size = int(config["vocab_size"])
 
@@ -125,7 +128,10 @@ async def amain(args):
             flush=True,
         )
 
-    engine.shutdown()
+    try:
+        engine.shutdown()
+    except Exception:
+        pass
 
     print(f"\n{'scenario':<16} {'TTFT med ms':>12} {'TTFT mean':>10} "
           f"{'TPOT med ms':>12} {'TPOT mean':>10} {'out tok/s':>10}")
