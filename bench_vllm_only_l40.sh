@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # vLLM-only steps of the L40 comparison (rerun after env fix).
 set -x
+# torch 2.11 wheel is cu130; pin the toolkit so flashinfer JIT matches torch.
+export CUDA_HOME=/usr/local/cuda-13.0
+export PATH=$CUDA_HOME/bin:$PATH
 cd /workspace/nano-vllm
 M=/workspace/DeepSeek-V2-Lite-Chat
 SCEN=1:512:128,4:512:128,8:512:128,1:2048:128
